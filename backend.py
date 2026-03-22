@@ -507,6 +507,10 @@ def _parse_nola_line_items(text: str) -> dict:
             cats["late_fees"] += amount
         elif any(kw in desc for kw in ("special assessment", "special asmt")):
             cats["special_assessments"] += amount
+        elif any(kw in desc for kw in ("over budget", "water bill", "water assessment",
+                                        "capital assessment", "special levy")):
+            # HOA/condo water bill overages and budget surcharges are special assessments
+            cats["special_assessments"] += amount
         elif any(kw in desc for kw in ("homeowner", "assessment - homeowner",
                                        "regular assessment", "monthly assessment",
                                        "assessments from")):
@@ -595,11 +599,38 @@ def _compute_demand_letter_table(
         maintenance += monthly_assessment * new_assessment_count
         late_fees   += D("25.00") * late_fee_new_count
 
-    # ── 3. Cash payments from ledger (Payment Received only, waivers excluded) ──
+        # ── 2b. Monthly recurring special charge (Over Budget / water bill) ──
+        # Detect from ledger: mode of "Over Budget" type charges is the monthly rate
+        from collections import Counter as _OBCounter
+        _ob_vals = [
+            float(D(str(t.get("charge", 0))))
+            for t in transactions
+            if str(t.get("type", "")).strip() == "Over Budget"
+            and float(str(t.get("charge", 0) or 0)) > 0
+        ]
+        if _ob_vals:
+            _monthly_ob = D(str(_OBCounter(_ob_vals).most_common(1)[0][0]))
+            special_assessments += _monthly_ob * new_assessment_count
+
+    # ── 3. Post-NOLA cash payments only (NOLA items already reflect pre-NOLA net) ──
+    # The NOLA represents the cumulative balance as of the NOLA date (gross charges
+    # minus all prior payments). Only payments made AFTER the NOLA date are new credits.
     cash_payments = ZERO
     for txn in transactions:
-        if str(txn.get("type", "")).strip() == "Payment Received":
-            cash_payments += D(txn.get("credit", 0))
+        if str(txn.get("type", "")).strip() != "Payment Received":
+            continue
+        txn_date_str = str(txn.get("date", "")).strip()
+        txn_dt = None
+        for _fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m/%d/%y"):
+            try:
+                txn_dt = datetime.datetime.strptime(txn_date_str, _fmt).date()
+                break
+            except (ValueError, AttributeError):
+                continue
+        # If NOLA date is known, only count payments after it;
+        # if NOLA date is unknown, count all payments (safe fallback)
+        if nola_dt is None or txn_dt is None or txn_dt > nola_dt:
+            cash_payments += D(str(txn.get("credit", 0)))
 
     # ── 4. Manual attorney-entered charges ───────────────────────────────
     certified_mail_d = D(certified_mail)
@@ -675,7 +706,9 @@ def _parse_ledger_transactions(text: str) -> list:
 
             # Classify type
             desc_l = desc.lower()
-            if "assessment" in desc_l:
+            if any(kw in desc_l for kw in ("over budget", "water bill", "water assessment")):
+                ttype = "Over Budget"
+            elif "assessment" in desc_l:
                 ttype = "Regular Assessment"
             elif "waive" in desc_l or "credit" in desc_l:
                 ttype = "Credit/Waiver"
