@@ -454,6 +454,179 @@ def _regex_extract(text: str, doc_type: str) -> dict:
     return e
 
 
+def _parse_nola_line_items(text: str) -> dict:
+    """
+    Extract individual charge line items from a Florida NOLA PDF and
+    categorize them into demand-letter buckets using Decimal arithmetic.
+
+    Buckets:  maintenance, special_assessments, late_fees, other_charges
+    (attorney_fees from NOLA are skipped — superseded by the attorney's
+     current-matter fee override entered at letter generation time.)
+    """
+    D = lambda v: Decimal(str(v)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    ZERO = Decimal("0.00")
+    cats = {
+        "maintenance":          ZERO,
+        "special_assessments":  ZERO,
+        "late_fees":            ZERO,
+        "other_charges":        ZERO,
+    }
+
+    for line in text.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        # Match trailing dollar amount (with or without $ sign)
+        m = _re.search(r"\$\s*([\d,]+\.\d{2})", line)
+        if not m:
+            m = _re.search(r"\b([\d,]+\.\d{2})\s*$", line)
+        if not m:
+            continue
+        try:
+            amount = D(m.group(1).replace(",", ""))
+        except Exception:
+            continue
+        if amount <= ZERO:
+            continue
+        desc = line[:m.start()].strip().lower()
+
+        # Skip total / balance summary rows
+        if any(kw in desc for kw in ("total", "balance due", "amount due",
+                                      "previous balance", "grand total")):
+            continue
+
+        # Skip body-text paragraphs (long sentences containing $ amounts)
+        # Real charge labels are short; paragraphs like "please remit $6427" are not
+        if len(desc) > 60 or any(kw in desc for kw in ("please", "remit", "to avoid",
+                                                          "action and expense", "collection agent")):
+            continue
+
+        # Categorize by keywords
+        # Check delinquent fee variant BEFORE plain homeowner check
+        if any(kw in desc for kw in ("delinquent fee", "late fee", "late charge")):
+            cats["late_fees"] += amount
+        elif any(kw in desc for kw in ("homeowner", "assessment - homeowner",
+                                       "regular assessment", "monthly assessment")):
+            cats["maintenance"] += amount
+        elif any(kw in desc for kw in ("special assessment", "special asmt")):
+            cats["special_assessments"] += amount
+        elif any(kw in desc for kw in ("delinquent fee", "late fee", "late charge")):
+            cats["late_fees"] += amount
+        elif any(kw in desc for kw in ("legal fee", "attorney fee",
+                                        "attorney's fee", "atty fee")):
+            pass  # Skip — superseded by current-matter attorney fee override
+        else:
+            # Water, Key Fob, Collection Fees, misc → other charges
+            cats["other_charges"] += amount
+
+    return cats
+
+
+def _compute_demand_letter_table(
+    nola_text: str,
+    transactions: list,
+    merged: dict,
+    through_date: datetime.date,
+    certified_mail: float = 0.0,
+    other_costs: float = 0.0,
+    attorney_fees_override: float = 0.0,
+) -> dict:
+    """
+    IQ-225 high-precision demand letter table calculator.
+
+    Ground-truth methodology:
+      1. Parse NOLA text for per-category gross charges (Decimal, ROUND_HALF_UP)
+      2. Add new monthly assessments accrued from (NOLA month+1) through through_date
+      3. Add late fees ($25/month) for each month that is actually past due
+      4. Add manual attorney-entered charges (certified mail, costs, atty fees)
+      5. Subtract CASH payments only (Payment Received type — waivers excluded)
+
+    Returns a dict with Decimal values for all 9 demand-letter rows and
+    through_date_str for the table header label.
+    """
+    D = lambda v: Decimal(str(v or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    ZERO = Decimal("0.00")
+
+    # ── 1. NOLA line items ───────────────────────────────────────────────
+    nola_cats           = _parse_nola_line_items(nola_text)
+    maintenance         = nola_cats["maintenance"]
+    special_assessments = nola_cats["special_assessments"]
+    late_fees           = nola_cats["late_fees"]
+    other_charges       = nola_cats["other_charges"]
+
+    # ── 2. New monthly assessments (NOLA month+1 → through_date month) ──
+    monthly_assessment = D(merged.get("monthly_assessment", "0"))
+    nola_date_str = str(merged.get("nola_date", ""))
+    nola_dt = None
+    for fmt in ("%m/%d/%Y", "%B %d, %Y", "%Y-%m-%d"):
+        try:
+            nola_dt = datetime.datetime.strptime(nola_date_str.strip(), fmt).date()
+            break
+        except (ValueError, AttributeError):
+            continue
+
+    new_assessment_count = 0
+    late_fee_new_count   = 0
+    today                = datetime.date.today()
+
+    if nola_dt and monthly_assessment > ZERO:
+        # First new month = month after the NOLA month
+        m1 = nola_dt.month
+        y1 = nola_dt.year
+        if m1 == 12:
+            cur = datetime.date(y1 + 1, 1, 1)
+        else:
+            cur = datetime.date(y1, m1 + 1, 1)
+
+        while (cur.year, cur.month) <= (through_date.year, through_date.month):
+            new_assessment_count += 1
+            # Late fee only if this month's assessment was already past due before today
+            if cur < today:
+                late_fee_new_count += 1
+            if cur.month == 12:
+                cur = datetime.date(cur.year + 1, 1, 1)
+            else:
+                cur = datetime.date(cur.year, cur.month + 1, 1)
+
+        maintenance += monthly_assessment * new_assessment_count
+        late_fees   += D("25.00") * late_fee_new_count
+
+    # ── 3. Cash payments from ledger (Payment Received only, waivers excluded) ──
+    cash_payments = ZERO
+    for txn in transactions:
+        if str(txn.get("type", "")).strip() == "Payment Received":
+            cash_payments += D(txn.get("credit", 0))
+
+    # ── 4. Manual attorney-entered charges ───────────────────────────────
+    certified_mail_d = D(certified_mail)
+    other_costs_d    = D(other_costs)
+    atty_fees_d      = D(attorney_fees_override)
+
+    # ── 5. Total outstanding ─────────────────────────────────────────────
+    total_outstanding = (
+        maintenance + special_assessments + late_fees +
+        other_charges + certified_mail_d + other_costs_d +
+        atty_fees_d - cash_payments
+    )
+
+    through_date_label = (
+        f"{through_date.strftime('%B')} {through_date.day}, {through_date.year}"
+    )
+
+    return {
+        "maintenance":          maintenance,
+        "special_assessments":  special_assessments,
+        "late_fees":            late_fees,
+        "other_charges":        other_charges,
+        "certified_mail":       certified_mail_d,
+        "other_costs":          other_costs_d,
+        "attorney_fees":        atty_fees_d,
+        "partial_payment":      cash_payments,
+        "total_outstanding":    total_outstanding,
+        "through_date_str":     through_date_label,
+    }
+
+
 def _parse_ledger_transactions(text: str) -> list:
     """Parse the actual transaction table from a FL HOA ledger PDF into line items."""
     items = []
@@ -1283,14 +1456,14 @@ async def generate_first_letter(request: FirstLetterRequest):
     cure_days  = str(e.get("cure_period_days", "45"))
     county     = e.get("county", "")
 
-    # Compute "through date": first of the month after the 45-day cure deadline
-    # (there is usually one more month of assessments accruing during the cure window)
-    _deadline = datetime.date.today() + datetime.timedelta(days=int(cure_days))
-    if _deadline.month == 12:
-        _through = _deadline.replace(year=_deadline.year + 1, month=1, day=1)
+    # Compute "through date": first of the next calendar month from today
+    # (= the next upcoming assessment due date, e.g. "April 1, 2026")
+    _today_dt = datetime.date.today()
+    if _today_dt.month == 12:
+        _through = datetime.date(_today_dt.year + 1, 1, 1)
     else:
-        _through = _deadline.replace(month=_deadline.month + 1, day=1)
-    through_date_str = _through.strftime("%B %Y")
+        _through = datetime.date(_today_dt.year, _today_dt.month + 1, 1)
+    through_date_str = f"{_through.strftime('%B')} {_through.day}, {_through.year}"
 
     special_assessments = e.get("special_assessment") or e.get("special_assessments", "")
     other_charges       = e.get("other_charges", "")
@@ -1393,16 +1566,12 @@ Do NOT write: a date, address block, Re: line, salutation, amount due table, lie
 
     # ── Body paragraphs (strip out everything except AMOUNT DUE block) ───────
     skip_keywords = (
-        # Amount due table rows (AI text version — replaced by Word table below)
         "amount due", "maintenance due including", "special assessments due including",
         "late fees, if applicable", "other charges:", "certified mail charges",
         "other costs:", "attorney's fees:", "attorney fees:", "partial payment:",
         "total outstanding:", "total amount", "interest (", "----",
-        # Signature block — added once by the hardcoded block below
         "sincerely,", "yours truly,",
-        # FDCPA / debt-collector notice — added once by the hardcoded block below
         "this communication is from a debt collector", "notice: this communication",
-        # Lien threat & safe harbor — added once by the hardcoded block below
         "unless the total amount set forth herein",
         "first mortgagees: please note",
     )
@@ -1423,7 +1592,6 @@ Do NOT write: a date, address block, Re: line, salutation, amount due table, lie
     _add_para("AMOUNT DUE SUMMARY", bold=True, size=10, space_after=4)
 
     def _money(val):
-        """Return formatted dollar string, or empty string if value is blank/placeholder."""
         if not val or str(val).strip() in ("", "See Ledger", "0", "0.00"):
             return ""
         s = str(val).strip()
@@ -1998,12 +2166,22 @@ Specifically, you need to look at **F.S. 718.116** regarding assessments and the
         }
 
 @app.post("/api/generate/ground-truth")
-async def generate_ground_truth():
+async def generate_ground_truth(
+    certified_mail: float = 40.0,
+    other_costs:    float = 16.0,
+    attorney_fees:  float = 400.0,
+):
     """
     One-shot ground truth generator.
     Discovers all files in uploads/, extracts text, runs regex extraction,
     parses actual ledger transactions, calculates 18% interest,
     and produces a 4-sheet audit Excel + statute-correct First Demand Letter.
+
+    Optional query params (attorney-entered charges):
+      certified_mail  — default $40.00
+      other_costs     — default $16.00
+      attorney_fees   — default $400.00
+
     Returns filenames for both generated files.
     """
     t0 = datetime.datetime.now()
@@ -2106,37 +2284,78 @@ async def generate_ground_truth():
 
     verification = _independent_verify(transactions, ledger_last_balance, delinquency)
 
+    # Legacy interest vars (used by Excel interest schedule sheet)
     principal_balance  = delinquency["principal"]
     interest_accrued   = delinquency["interest"]
     late_fee           = delinquency["late_fees"]
-    attorney_fees_est  = 0.00  # not yet authorized in this matter
-    total_amount_owed  = round(principal_balance + interest_accrued + late_fee + attorney_fees_est, 2)
 
-    # Keep legacy vars for template rows that reference them
-    nola_date_str = merged.get("nola_date", "01/26/2026")
-    annual_rate   = 0.18
+    nola_date_str   = merged.get("nola_date", "01/26/2026")
     days_since_nola = 0
     try:
-        nola_dt = datetime.datetime.strptime(nola_date_str, "%m/%d/%Y").date()
-        days_since_nola = (datetime.date.today() - nola_dt).days
+        _nola_dt_leg = datetime.datetime.strptime(nola_date_str, "%m/%d/%Y").date()
+        days_since_nola = (datetime.date.today() - _nola_dt_leg).days
     except Exception:
         pass
 
+    # ── Derive monthly_assessment from ledger transactions (most reliable) ──
+    # The NOLA regex can pick up cumulative past balances (e.g. $3,211.32) as
+    # "monthly_assessment". Override that with the mode of actual Regular
+    # Assessment charges from the ledger, which will be the true monthly rate.
+    from collections import Counter as _Counter
+    _asmt_charges = [
+        t.get("charge", 0) for t in transactions
+        if str(t.get("type", "")).strip() in ("Regular Assessment",) and t.get("charge", 0) > 0
+    ]
+    if _asmt_charges:
+        _monthly_mode = _Counter(_asmt_charges).most_common(1)[0][0]
+        merged["monthly_assessment"] = str(_monthly_mode)
+
+    # ── IQ-225 demand-letter table — ground-truth math engine ─────────────
+    # through_date = first of next calendar month from today
+    _td = datetime.date.today()
+    if _td.month == 12:
+        _through_date = datetime.date(_td.year + 1, 1, 1)
+    else:
+        _through_date = datetime.date(_td.year, _td.month + 1, 1)
+
+    nola_text_for_table = file_map.get("nola", {}).get("text", "")
+    tbl = _compute_demand_letter_table(
+        nola_text       = nola_text_for_table,
+        transactions    = transactions,
+        merged          = merged,
+        through_date    = _through_date,
+        certified_mail  = certified_mail,
+        other_costs     = other_costs,
+        attorney_fees_override = attorney_fees,
+    )
+
+    # Format Decimal → "X.XX" string for entity fields used by letter generator
+    def _ds(d) -> str:
+        return f"{d:.2f}" if d else "0.00"
+
     merged.update({
-        "principal_balance": f"{principal_balance:.2f}",
-        "interest_accrued": f"{interest_accrued:.2f}",
-        "late_fees": f"{late_fee:.2f}",
-        "attorney_fees": f"{attorney_fees_est:.2f}",
-        "total_amount_owed": f"{total_amount_owed:.2f}",
-        "total_balance": f"{principal_balance:.2f}",
-        "months_delinquent": str(delinquency["unpaid_count"]),
-        "ledger_through_date": transactions[-1]["date"] if transactions else "",
-        "oldest_unpaid_date": transactions[0]["date"] if transactions else "",
-        "source_nola_file": file_map.get("nola", {}).get("path", Path("")).name,
-        "source_ledger_file": file_map.get("ledger", {}).get("path", Path("")).name,
-        "source_affidavit_file": file_map.get("affidavit", {}).get("path", Path("")).name,
-        "ground_truth_verified": "Pending — Human Review Required",
-        "matter_id": "#CC-8921",
+        # 9-row demand letter fields (used by generate_first_letter)
+        "principal_balance":      _ds(tbl["maintenance"]),
+        "special_assessments":    _ds(tbl["special_assessments"]),
+        "late_fees":              _ds(tbl["late_fees"]),
+        "other_charges":          _ds(tbl["other_charges"]),
+        "certified_mail_charges": _ds(tbl["certified_mail"]),
+        "other_costs":            _ds(tbl["other_costs"]),
+        "attorney_fees":          _ds(tbl["attorney_fees"]),
+        "partial_payment":        _ds(tbl["partial_payment"]),
+        "total_amount_owed":      _ds(tbl["total_outstanding"]),
+        "total_balance":          _ds(tbl["total_outstanding"]),
+        "through_date_str":       tbl["through_date_str"],
+        # Legacy / display fields
+        "interest_accrued":       f"{interest_accrued:.2f}",
+        "months_delinquent":      str(delinquency["unpaid_count"]),
+        "ledger_through_date":    transactions[-1]["date"] if transactions else "",
+        "oldest_unpaid_date":     transactions[0]["date"] if transactions else "",
+        "source_nola_file":       file_map.get("nola", {}).get("path", Path("")).name,
+        "source_ledger_file":     file_map.get("ledger", {}).get("path", Path("")).name,
+        "source_affidavit_file":  file_map.get("affidavit", {}).get("path", Path("")).name,
+        "ground_truth_verified":  "Pending — Human Review Required",
+        "matter_id":              "#CC-8921",
     })
 
     # ------------------------------------------------------------------ #
@@ -2288,7 +2507,7 @@ async def generate_ground_truth():
          "YES" if merged.get("cure_period_days") == "30" else "VERIFY",
          f"Cure period: {merged.get('cure_period_days', '?')} days"),
         ("Total amount specifically stated", "§ 718.116(6)(b)(1)", "YES",
-         f"${total_amount_owed:.2f}"),
+         f"${tbl['total_outstanding']:.2f}"),
         ("Interest at 18% per annum (per installment)", "§ 718.116(3)", "YES",
          f"${interest_accrued:.2f} accrued via CC engine"),
         ("Late charges (per NOLA)", "§ 718.116(6)(a)", "YES",
@@ -2303,6 +2522,9 @@ async def generate_ground_truth():
          f"Through {merged.get('ledger_through_date', '?')}"),
         ("First mortgagee safe harbor reviewed", "§ 718.116(1)(b)", "VERIFY", ""),
     ]
+
+    # Florida-statute 9-row demand letter table (ground truth values from IQ-225 engine)
+    _through_label = tbl["through_date_str"]
 
     summary_rows = [
         ("MATTER SUMMARY", ""),
@@ -2327,25 +2549,35 @@ async def generate_ground_truth():
         ("Unit / Parcel",          unit),
         ("Property Address",       merged.get("property_address", "")),
         ("", ""),
-        ("FINANCIAL SUMMARY",      ""),
+        ("DEMAND LETTER — AMOUNT DUE BREAKDOWN",  ""),
+        (f"Maintenance due including {_through_label}",
+         f"${tbl['maintenance']:.2f}"),
+        (f"Special assessments due including {_through_label}",
+         f"${tbl['special_assessments']:.2f}" if tbl['special_assessments'] else ""),
+        ("Late fees, if applicable",
+         f"${tbl['late_fees']:.2f}" if tbl['late_fees'] else ""),
+        ("Other charges",
+         f"${tbl['other_charges']:.2f}" if tbl['other_charges'] else ""),
+        ("Certified mail charges",
+         f"${tbl['certified_mail']:.2f}" if tbl['certified_mail'] else ""),
+        ("Other costs",
+         f"${tbl['other_costs']:.2f}" if tbl['other_costs'] else ""),
+        ("Attorney's fees",
+         f"${tbl['attorney_fees']:.2f}" if tbl['attorney_fees'] else ""),
+        ("Partial Payment (cash only)",
+         f"(${tbl['partial_payment']:.2f})" if tbl['partial_payment'] else ""),
+        ("TOTAL OUTSTANDING",      f"${tbl['total_outstanding']:.2f}"),
+        ("", ""),
+        ("FINANCIAL DETAIL",       ""),
         ("Monthly Assessment",     f"${merged.get('monthly_assessment', '')}"),
         ("Assessment Start Date",  merged.get("oldest_unpaid_date", "")),
         ("Months Delinquent",      merged.get("months_delinquent", "")),
-        ("Ledger Through Date",    merged.get("ledger_through_date", "")),
         ("", ""),
-        ("Principal Balance",      f"${merged.get('principal_balance', '0.00')}"),
-        ("Late Fees ($25 per NOLA)", f"${merged.get('late_fees', '0.00')}"),
-        (f"Interest (18% p.a. × {days_since_nola} days)", f"${merged.get('interest_accrued', '0.00')}"),
-        ("Attorney Fees",          f"${merged.get('attorney_fees', '0.00')}"),
-        ("TOTAL AMOUNT DUE",       f"${merged.get('total_amount_owed', '0.00')}"),
-        ("", ""),
-        ("INTEREST CALCULATION",   ""),
+        ("INTEREST CALCULATION (18% per annum, per installment)",   ""),
         ("Rate",                   "18.00% per annum (F.S. § 718.116(3))"),
-        ("Principal Subject to Interest", f"${merged.get('principal_balance', '0.00')}"),
         ("NOLA Date",              nola_date_str),
-        ("Days Elapsed",           str(days_since_nola)),
-        ("Formula",                f"${merged.get('principal_balance','0')} × 18% × {days_since_nola}/365"),
-        ("Interest Amount",        f"${merged.get('interest_accrued', '0.00')}"),
+        ("Days Elapsed Since NOLA", str(days_since_nola)),
+        ("Interest Accrued",       f"${merged.get('interest_accrued', '0.00')}"),
         ("", ""),
         ("NOLA / NOTICE",          ""),
         ("NOLA Date",              merged.get("nola_date", "")),
@@ -2510,13 +2742,13 @@ async def generate_ground_truth():
             df2 = pd.DataFrame(summary_rows, columns=["Field", "Value"])
             df2.to_excel(writer, sheet_name="Statement of Account", index=False)
             ws2 = writer.sheets["Statement of Account"]
-            ws2.column_dimensions["A"].width = 42
-            ws2.column_dimensions["B"].width = 55
+            ws2.column_dimensions["A"].width = 52
+            ws2.column_dimensions["B"].width = 22
             for row in ws2.iter_rows():
                 fv = str(row[0].value or "")
                 vv = str(row[1].value or "")
                 is_section = fv and not vv.strip() and fv.isupper() and len(fv) > 3
-                is_total   = fv == "TOTAL AMOUNT DUE"
+                is_total   = fv in ("TOTAL OUTSTANDING", "TOTAL AMOUNT DUE")
                 if is_section:
                     for cell in row:
                         cell.font = white_bold
@@ -2718,12 +2950,18 @@ async def generate_ground_truth():
         "transactions_found": len(transactions),
         "fields_merged": len([v for v in merged.values() if v]),
         "financials": {
-            "principal_balance": principal_balance,
-            "interest_accrued": interest_accrued,
-            "late_fees": late_fee,
-            "attorney_fees": attorney_fees_est,
-            "total_amount_owed": total_amount_owed,
-            "days_since_nola": days_since_nola,
+            "maintenance":          float(tbl["maintenance"]),
+            "special_assessments":  float(tbl["special_assessments"]),
+            "late_fees":            float(tbl["late_fees"]),
+            "other_charges":        float(tbl["other_charges"]),
+            "certified_mail":       float(tbl["certified_mail"]),
+            "other_costs":          float(tbl["other_costs"]),
+            "attorney_fees":        float(tbl["attorney_fees"]),
+            "partial_payment":      float(tbl["partial_payment"]),
+            "total_outstanding":    float(tbl["total_outstanding"]),
+            "interest_accrued":     float(interest_accrued),
+            "days_since_nola":      days_since_nola,
+            "through_date":         tbl["through_date_str"],
         },
         "verification": {
             "ledger_stated_balance":  verification["ledger_stated_balance"],

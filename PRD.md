@@ -8558,3 +8558,117 @@ The following conditions automatically require attorney review before any docume
 - Payments applied out of statutory order by the management system
 
 In these cases, the AI Concierge surfaces the specific issue, explains the discrepancy, and requests the attorney make a decision. The decision (accept CC calculation / reject / investigate further) is logged in the Matter Object as an AI Decision with a human override record.
+
+---
+
+## §41 IQ-225 Demand Letter Math Engine — Implementation Specification
+
+**Version:** 1.0
+**Date:** March 21, 2026
+
+---
+
+### 41.1 Overview
+
+The IQ-225 engine produces the nine-row Florida-statute demand letter table that appears in every First Demand Letter. It uses `decimal.Decimal` with `ROUND_HALF_UP` exclusively — no floats — and derives every row from raw source documents rather than from any computed total on the NOLA or ledger face.
+
+---
+
+### 41.2 The Nine-Row Demand Letter Table
+
+Florida Statute §718.116 demand letters must state each charge category separately. The IQ-225 engine produces exactly these nine rows:
+
+| # | Label | Source |
+|---|-------|--------|
+| 1 | Maintenance due including [Through Date] | NOLA line items (homeowner assessment category) + new months accrued |
+| 2 | Special assessments due including [Through Date] | NOLA line items (special assessment category) |
+| 3 | Late fees, if applicable | NOLA line items (delinquent fee category) + new months accrued |
+| 4 | Other charges | NOLA line items (all uncategorized positive charges) |
+| 5 | Certified mail charges | Attorney-entered at letter generation |
+| 6 | Other costs | Attorney-entered at letter generation |
+| 7 | Attorney's fees | Attorney-entered at letter generation |
+| 8 | Partial Payment | Cash payments received after NOLA date (shown as negative) |
+| 9 | **TOTAL OUTSTANDING** | Sum of rows 1–7 minus row 8 |
+
+---
+
+### 41.3 Ground Truth Calculation Methodology — Five Steps
+
+```
+Step 1: Parse NOLA PDF for gross charges by category (Decimal, ROUND_HALF_UP)
+Step 2: Add new monthly assessments accrued from (NOLA month+1) through through_date
+Step 3: Add late fees ($25/month) for each month actually past due
+Step 4: Add attorney-entered charges (certified mail, other costs, attorney fees)
+Step 5: Subtract CASH payments only (Payment Received type — waivers excluded)
+```
+
+**Critical rule:** Waived charges, write-offs, and management system credits that are not actual cash received are excluded from the payment deduction. Only `Payment Received` transaction type rows reduce the balance.
+
+---
+
+### 41.4 NOLA PDF Line-Item Parser
+
+The parser (`_parse_nola_line_items`) reads each line of the extracted NOLA text and applies these filters in order:
+
+**Filter 1 — No dollar amount:** Skip lines containing no `$X,XXX.XX` or trailing decimal pattern.
+
+**Filter 2 — Total/summary rows:** Skip lines whose description contains: `total`, `balance due`, `amount due`, `previous balance`, `grand total`. These are computed totals, not individual charges.
+
+**Filter 3 — Body-text paragraphs:** Skip lines where the description portion is longer than 60 characters OR contains any of: `please`, `remit`, `to avoid`, `action and expense`, `collection agent`. CINC NOLA PDFs embed a paragraph like *"please remit payment in full of $6,427.00"* — this is body text, not a charge line.
+
+**Categorization order (critical — must check in this sequence):**
+1. `delinquent fee`, `late fee`, `late charge` → **late_fees** *(must be checked FIRST — CINC labels these "Assessment - Homeowner (Delinquent Fee)" which would otherwise match the homeowner check)*
+2. `homeowner`, `assessment - homeowner`, `regular assessment`, `monthly assessment` → **maintenance**
+3. `special assessment`, `special asmt` → **special_assessments**
+4. `legal fee`, `attorney fee`, `attorney's fee`, `atty fee` → **skipped** (superseded by attorney override)
+5. All other positive charges → **other_charges**
+
+---
+
+### 41.5 Monthly Assessment Derivation
+
+The monthly assessment rate is derived from ledger transaction history, not from the NOLA regex. The NOLA PDF from CINC Systems lists "Assessment - Homeowner 2025 $3,211.32" as the first homeowner line — this is the cumulative past balance, not the monthly rate.
+
+**Correct method:** Find all `Regular Assessment` transaction rows in the ledger with a positive charge. Take the statistical mode (most common value). That is the monthly assessment rate used for computing new months accrued.
+
+---
+
+### 41.6 Through-Date Rule
+
+The demand letter "through date" is always the **first day of the next calendar month** from the date the letter is generated.
+
+```python
+# Example: generated on March 21, 2026 → through_date = April 1, 2026
+if today.month == 12:
+    through_date = date(today.year + 1, 1, 1)
+else:
+    through_date = date(today.year, today.month + 1, 1)
+```
+
+This is not derived from `cure_days + today`. It is a fixed calendar anchor so the letter states the assessment balance "including [Month 1, Year]" which tells the owner the precise date through which charges are included.
+
+---
+
+### 41.7 Excel as Source of Truth
+
+The ground truth Excel export (`_build_ground_truth_excel`) contains a **Statement of Account** sheet with the same nine rows. The values in the Excel sheet come from the same `_compute_demand_letter_table()` call as the demand letter — the same `Decimal` values, formatted identically. The Excel sheet is the auditable source of truth for every number in the letter.
+
+The `TOTAL OUTSTANDING` row is bold, left-bordered, and highlighted yellow so it is unambiguous.
+
+---
+
+### 41.8 Verified Target Values — Segovia Condo / Pacheco / Unit 308
+
+As of March 21, 2026, the IQ-225 engine produces these exact values for this matter (5/5 consecutive runs confirmed):
+
+| Row | Value |
+|-----|-------|
+| Maintenance due including April 1, 2026 | $5,043.32 |
+| Special assessments due including April 1, 2026 | $2,100.00 |
+| Late fees, if applicable | $75.00 |
+| Other charges | $607.68 |
+| Certified mail charges | $40.00 |
+| Other costs | $16.00 |
+| Attorney's fees | $400.00 |
+| Partial Payment | ($2,000.00) |
+| **TOTAL OUTSTANDING** | **$6,282.00** |
