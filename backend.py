@@ -1302,63 +1302,16 @@ async def generate_first_letter(request: FirstLetterRequest):
     lien_threat  = sc["lien_threat"].format(cure_days=cure_days, entity_label=sc["entity_label"])
     safe_harbor  = sc["safe_harbor"]
 
-    letter_prompt = f"""You are a Florida collection law attorney drafting a statute-compliant First Demand / Pre-Lien Letter.
+    letter_prompt = f"""You are a Florida collection law attorney. Write EXACTLY TWO plain-text paragraphs for a {entity_type} first demand letter. Nothing else.
 
-ENTITY TYPE: {entity_type}
-GOVERNING STATUTE: {sc["chapter"]}
-NOTICE AUTHORITY: {sc["notice_section"]}
-LIEN AUTHORITY: {sc["lien_section"]}
-INTEREST AUTHORITY: {sc["interest_section"]}
-ATTORNEY FEE AUTHORITY: {sc["fee_section"]}
+PARAGRAPH 1 — Opening:
+One paragraph stating that this letter is formal notice that {owner}'s account with {assoc} is delinquent for {entity_type} {sc["entity_label"]} {unit}, and that this notice is issued pursuant to {sc["notice_section"]}, Florida Statutes. Do not add dollar amounts here.
 
-MATTER VARIABLES:
-- Owner: {owner}
-- {entity_type} Unit/Parcel: {unit}
-- Property: {address}
-- County: {county}
-- Association: {assoc}
-- Principal Balance: ${principal}
-- Late Fees: ${late_fees}
-- Interest (18% p.a.): ${interest}
-- Attorney Fees: ${atty_fees}
-- TOTAL DUE: ${balance}
-- NOLA Issued: {nola_date}
-- Payment Due Date: {due_date or 'within ' + cure_days + ' days of this letter'}
-- Today: {today}
-
-MANDATORY STATUTORY LANGUAGE TO INCLUDE VERBATIM:
+PARAGRAPH 2 — Mandatory Statutory Notice (copy this verbatim, word for word):
 {notice_text}
 
-LIEN THREAT (use verbatim):
-{lien_threat}
-
-SAFE HARBOR (include as last paragraph before signature):
-{safe_harbor}
-
-LETTER STRUCTURE (write plain paragraphs, NO markdown):
-1. Date line: {today}
-2. Owner name and property address block
-3. Re: line — "Re: Notice of Delinquent Assessments — {sc["entity_label"].title()} {unit}, {assoc} | Matter: {request.matter_id}"
-4. "Dear {owner}:"
-5. Opening paragraph — purpose of this letter, governing statute
-6. The mandatory statutory notice paragraph (verbatim above)
-7. AMOUNT DUE SUMMARY section (plain text, these exact rows only):
-   Maintenance due including {through_date_str}:           ${principal}
-   Special assessments due including {through_date_str}:   ${special_assessments or 'N/A'}
-   Late fees, if applicable:                               ${late_fees}
-   Other charges:                                          ${other_charges or 'N/A'}
-   Certified mail charges:                                 ${certified_mail_chg or 'N/A'}
-   Other costs:                                            ${other_costs or 'N/A'}
-   Attorney's fees:                                        ${atty_fees}
-   Partial Payment:                                        (${partial_payment or 'N/A'})
-   --------------------------------
-   TOTAL OUTSTANDING:                                      ${balance}
-8. Lien threat paragraph (verbatim above)
-9. Safe harbor paragraph (verbatim above)
-10. Payment instructions and contact reference
-
-DO NOT include a signature block or FDCPA/debt-collector notice — those will be added to the document separately.
-Keep the body under 600 words. Do not add markdown formatting.
+STOP. Output only these two paragraphs separated by a blank line.
+Do NOT write: a date, address block, Re: line, salutation, amount due table, lien threat, safe harbor, payment instructions, signature, or FDCPA notice. Those are added separately.
 """
 
     letter_body = ""
@@ -1381,50 +1334,14 @@ Keep the body under 600 words. Do not add markdown formatting.
         except Exception:
             pass
 
-    # Statute-correct fallback template
+    # Fallback: two narrative paragraphs only — DOCX builder adds all structure
     if not letter_body:
-        letter_body = f"""{today}
-
-{owner}
-{address}
-
-Re: Notice of Delinquent Assessments — {sc["entity_label"].title()} {unit}, {assoc}
-Matter: {request.matter_id}
-
-Dear {owner}:
-
-This letter constitutes formal notice that your account with {assoc} is delinquent. This notice is being sent pursuant to {sc["notice_section"]}, Florida Statutes.
-
-{notice_text}
-
-AMOUNT DUE SUMMARY
-----------------------------------------------------
-Maintenance due including {through_date_str}:          ${principal}
-Special assessments due including {through_date_str}:  ${special_assessments or "N/A"}
-Late fees, if applicable:                              ${late_fees}
-Other charges:                                         ${other_charges or "N/A"}
-Certified mail charges:                                ${certified_mail_chg or "N/A"}
-Other costs:                                           ${other_costs or "N/A"}
-Attorney's fees:                                       ${atty_fees}
-Partial Payment:                                       ({("$" + str(partial_payment)) if partial_payment else "N/A"})
-----------------------------------------------------
-TOTAL OUTSTANDING:                                     ${balance}
-----------------------------------------------------
-
-{lien_threat}
-
-{safe_harbor}
-
-To remit payment or to dispute any item reflected in the above balance, please contact this office in writing, referencing matter number {request.matter_id}. The due date for payment is {due_date or 'within ' + cure_days + ' calendar days of the date of this letter'}.
-
-Sincerely,
-
-{request.attorney_name}
-{request.firm_name}
-Counsel for {assoc}
-
-NOTICE: This communication is from a debt collector. Any information obtained will be used for that purpose.
-"""
+        letter_body = (
+            f"This letter constitutes formal notice that your account with {assoc} is "
+            f"delinquent for {entity_type} {sc['entity_label'].title()} {unit}. "
+            f"This notice is issued pursuant to {sc['notice_section']}, Florida Statutes.\n\n"
+            f"{notice_text}"
+        )
 
     # Build DOCX
     owner_last = owner.split()[-1] if owner not in ("Unit Owner", "Parcel Owner") else "Owner"
