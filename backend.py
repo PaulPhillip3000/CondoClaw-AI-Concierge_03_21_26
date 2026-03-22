@@ -1283,6 +1283,21 @@ async def generate_first_letter(request: FirstLetterRequest):
     cure_days  = str(e.get("cure_period_days", "45"))
     county     = e.get("county", "")
 
+    # Compute "through date": first of the month after the 45-day cure deadline
+    # (there is usually one more month of assessments accruing during the cure window)
+    _deadline = datetime.date.today() + datetime.timedelta(days=int(cure_days))
+    if _deadline.month == 12:
+        _through = _deadline.replace(year=_deadline.year + 1, month=1, day=1)
+    else:
+        _through = _deadline.replace(month=_deadline.month + 1, day=1)
+    through_date_str = _through.strftime("%B %Y")
+
+    special_assessments = e.get("special_assessment") or e.get("special_assessments", "")
+    other_charges       = e.get("other_charges", "")
+    certified_mail_chg  = e.get("certified_mail_charges") or e.get("certified_mail_charge", "")
+    other_costs         = e.get("other_costs", "")
+    partial_payment     = e.get("partial_payment", "")
+
     notice_text  = sc["notice_text"]
     lien_threat  = sc["lien_threat"].format(cure_days=cure_days, entity_label=sc["entity_label"])
     safe_harbor  = sc["safe_harbor"]
@@ -1327,19 +1342,22 @@ LETTER STRUCTURE (write plain paragraphs, NO markdown):
 4. "Dear {owner}:"
 5. Opening paragraph — purpose of this letter, governing statute
 6. The mandatory statutory notice paragraph (verbatim above)
-7. AMOUNT DUE SUMMARY section (plain text table with these exact rows):
-   Regular Assessments:  ${principal}
-   Late Charges:         ${late_fees}
-   Interest (18% p.a.): ${interest}
-   Attorney's Fees:      ${atty_fees}
+7. AMOUNT DUE SUMMARY section (plain text, these exact rows only):
+   Maintenance due including {through_date_str}:           ${principal}
+   Special assessments due including {through_date_str}:   ${special_assessments or 'N/A'}
+   Late fees, if applicable:                               ${late_fees}
+   Other charges:                                          ${other_charges or 'N/A'}
+   Certified mail charges:                                 ${certified_mail_chg or 'N/A'}
+   Other costs:                                            ${other_costs or 'N/A'}
+   Attorney's fees:                                        ${atty_fees}
+   Partial Payment:                                        (${partial_payment or 'N/A'})
    --------------------------------
-   TOTAL AMOUNT DUE:     ${balance}
+   TOTAL OUTSTANDING:                                      ${balance}
 8. Lien threat paragraph (verbatim above)
 9. Safe harbor paragraph (verbatim above)
 10. Payment instructions and contact reference
-11. Signature block: {request.attorney_name} / {request.firm_name} / Counsel for {assoc}
-12. FDCPA notice: "This communication is from a debt collector. Any information obtained will be used for that purpose."
 
+DO NOT include a signature block or FDCPA/debt-collector notice — those will be added to the document separately.
 Keep the body under 600 words. Do not add markdown formatting.
 """
 
@@ -1381,12 +1399,16 @@ This letter constitutes formal notice that your account with {assoc} is delinque
 
 AMOUNT DUE SUMMARY
 ----------------------------------------------------
-Regular Assessments:         ${principal}
-Late Charges:                ${late_fees}
-Interest ({sc["interest_rate"]}):  ${interest}
-Attorney's Fees:             ${atty_fees}
+Maintenance due including {through_date_str}:          ${principal}
+Special assessments due including {through_date_str}:  ${special_assessments or "N/A"}
+Late fees, if applicable:                              ${late_fees}
+Other charges:                                         ${other_charges or "N/A"}
+Certified mail charges:                                ${certified_mail_chg or "N/A"}
+Other costs:                                           ${other_costs or "N/A"}
+Attorney's fees:                                       ${atty_fees}
+Partial Payment:                                       ({("$" + str(partial_payment)) if partial_payment else "N/A"})
 ----------------------------------------------------
-TOTAL AMOUNT DUE:            ${balance}
+TOTAL OUTSTANDING:                                     ${balance}
 ----------------------------------------------------
 
 {lien_threat}
@@ -1453,7 +1475,20 @@ NOTICE: This communication is from a debt collector. Any information obtained wi
     _add_para(f"Dear {owner}:", size=10, space_after=8)
 
     # ── Body paragraphs (strip out everything except AMOUNT DUE block) ───────
-    skip_keywords = ("amount due", "regular assess", "late charge", "interest (", "attorney", "----", "total amount")
+    skip_keywords = (
+        # Amount due table rows (AI text version — replaced by Word table below)
+        "amount due", "maintenance due including", "special assessments due including",
+        "late fees, if applicable", "other charges:", "certified mail charges",
+        "other costs:", "attorney's fees:", "attorney fees:", "partial payment:",
+        "total outstanding:", "total amount", "interest (", "----",
+        # Signature block — added once by the hardcoded block below
+        "sincerely,", "yours truly,",
+        # FDCPA / debt-collector notice — added once by the hardcoded block below
+        "this communication is from a debt collector", "notice: this communication",
+        # Lien threat & safe harbor — added once by the hardcoded block below
+        "unless the total amount set forth herein",
+        "first mortgagees: please note",
+    )
     for block in letter_body.split("\n\n"):
         block = block.strip()
         if not block:
@@ -1467,28 +1502,39 @@ NOTICE: This communication is from a debt collector. Any information obtained wi
             continue
         _add_para(block, size=10, space_after=8)
 
-    # ── Amount Due Summary — proper Word table ────────────────────────────────
+    # ── Amount Due Summary — Florida-statute box format ───────────────────────
     _add_para("AMOUNT DUE SUMMARY", bold=True, size=10, space_after=4)
-    tbl = doc.add_table(rows=6, cols=2)
-    tbl.style = "Table Grid"
+
+    def _money(val):
+        """Return formatted dollar string, or empty string if value is blank/placeholder."""
+        if not val or str(val).strip() in ("", "See Ledger", "0", "0.00"):
+            return ""
+        s = str(val).strip()
+        return s if s.startswith("$") else f"${s}"
+
     tbl_data = [
-        ("Regular Assessments",        f"${principal}"),
-        ("Late Charges",               f"${late_fees}"),
-        (f"Interest ({sc['interest_rate']})", f"${interest}"),
-        ("Attorney's Fees",            f"${atty_fees}"),
-        ("",                           ""),
-        ("TOTAL AMOUNT DUE",           f"${balance}"),
+        (f"Maintenance due including {through_date_str}:",         _money(principal)),
+        (f"Special assessments due including {through_date_str}:", _money(special_assessments)),
+        ("Late fees, if applicable:",                              _money(late_fees)),
+        ("Other charges:",                                         _money(other_charges)),
+        ("Certified mail charges:",                                _money(certified_mail_chg)),
+        ("Other costs:",                                           _money(other_costs)),
+        ("Attorney's fees:",                                       _money(atty_fees)),
+        ("Partial Payment:",                                       f"({_money(partial_payment)})" if partial_payment else ""),
+        ("TOTAL OUTSTANDING:",                                     _money(balance)),
     ]
+    tbl = doc.add_table(rows=len(tbl_data), cols=2)
+    tbl.style = "Table Grid"
     for i, (label, val) in enumerate(tbl_data):
         row = tbl.rows[i]
         row.cells[0].text = label
         row.cells[1].text = val
-        is_total = label == "TOTAL AMOUNT DUE"
+        is_total = "TOTAL OUTSTANDING" in label
         for cell in row.cells:
             for para in cell.paragraphs:
                 for run in para.runs:
                     run.bold = is_total
-                    run.font.size = Pt(10 if not is_total else 11)
+                    run.font.size = Pt(11 if is_total else 10)
     doc.add_paragraph()  # spacer after table
 
     # ── Lien threat, safe harbor, closing paragraphs ─────────────────────────
