@@ -505,13 +505,17 @@ def _parse_nola_line_items(text: str) -> dict:
         # Check delinquent fee variant BEFORE plain homeowner check
         if any(kw in desc for kw in ("delinquent fee", "late fee", "late charge")):
             cats["late_fees"] += amount
-        elif any(kw in desc for kw in ("homeowner", "assessment - homeowner",
-                                       "regular assessment", "monthly assessment")):
-            cats["maintenance"] += amount
         elif any(kw in desc for kw in ("special assessment", "special asmt")):
             cats["special_assessments"] += amount
-        elif any(kw in desc for kw in ("delinquent fee", "late fee", "late charge")):
-            cats["late_fees"] += amount
+        elif any(kw in desc for kw in ("homeowner", "assessment - homeowner",
+                                       "regular assessment", "monthly assessment",
+                                       "assessments from")):
+            # "assessments from" covers FPMS NOLA format:
+            # "Assessments from Jul 01, 2025 to Sep 24, 2025 $458.76"
+            cats["maintenance"] += amount
+        elif desc.startswith("assessments") and "special" not in desc:
+            # Catch-all for bare "Assessments" lines not already classified
+            cats["maintenance"] += amount
         elif any(kw in desc for kw in ("legal fee", "attorney fee",
                                         "attorney's fee", "atty fee")):
             pass  # Skip — superseded by current-matter attorney fee override
@@ -1450,32 +1454,33 @@ async def _load_entities_from_uploads(
         return "nola"
 
     file_map: dict = {}
-    for fp in UPLOAD_DIR.iterdir():
-        if fp.suffix.lower() not in (".pdf", ".xlsx", ".xls", ".csv", ".docx"):
-            continue
+    # Sort newest-first so the most recently uploaded matter always wins
+    upload_files = sorted(
+        [fp for fp in UPLOAD_DIR.iterdir()
+         if fp.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv", ".docx")],
+        key=lambda fp: fp.stat().st_mtime,
+        reverse=True,
+    )
+    for fp in upload_files:
         doc_type = _classify(fp.name)
+        if doc_type in file_map:
+            continue  # already have a newer file for this type
         raw_text = await asyncio.to_thread(extract_text_from_file, fp.read_bytes(), fp.name)
         entities = _regex_extract(raw_text, doc_type)
         transactions = _parse_ledger_transactions(raw_text) if doc_type == "ledger" else []
-        if doc_type not in file_map or len(raw_text) > len(file_map[doc_type].get("text", "")):
-            file_map[doc_type] = {"text": raw_text, "entities": entities, "transactions": transactions}
+        file_map[doc_type] = {"text": raw_text, "entities": entities, "transactions": transactions}
 
     merged: dict = {}
     for dtype in ("affidavit", "ledger", "nola"):
         if dtype in file_map:
             merged.update({k: v for k, v in file_map[dtype]["entities"].items() if v})
 
-    # Hard defaults so the letter always has real values
+    # Generic defaults — matter-specific values come from uploaded files via regex
     merged.setdefault("association_name", "Segovia Condominium Association II, Inc.")
-    merged.setdefault("owner_name",       "Jenny Palacios Pacheco")
-    merged.setdefault("unit_number",      "308")
-    merged.setdefault("property_address", "1221 SW 122 Ave, Unit 308, Miami, FL 33185")
     merged.setdefault("county",           "Miami-Dade")
     merged.setdefault("statute_type",     "718")
     merged.setdefault("entity_type",      "Condominium")
     merged.setdefault("cure_period_days", "30")
-    merged.setdefault("nola_date",        "01/26/2026")
-    merged.setdefault("monthly_assessment", "458.00")
 
     # Derive monthly_assessment from ledger transaction mode
     transactions = file_map.get("ledger", {}).get("transactions", [])
@@ -1528,14 +1533,32 @@ async def generate_first_letter(request: FirstLetterRequest):
     api_key = os.getenv("GOOGLE_API_KEY")
     e = request.entities
 
-    # ── Auto-heal: if frontend sent empty/bad entities, load from disk ──
-    _needs_reload = (
-        not e
-        or e.get("owner_name", "") in ("", "Review Required")
-        or len([v for v in e.values() if v and v not in ("—", "Review Required")]) < 3
-    )
-    if _needs_reload and list(UPLOAD_DIR.iterdir()):
-        e = await _load_entities_from_uploads()
+    # ── Always load IQ-225 financials from disk when uploads exist ──────────
+    # _load_entities_from_uploads uses mtime ordering (newest matter wins) and
+    # runs the full IQ-225 engine so every row of the demand table is populated.
+    # If the frontend sent valid identity fields, keep those; otherwise use disk.
+    _upload_files = [fp for fp in UPLOAD_DIR.iterdir()
+                     if fp.suffix.lower() in (".pdf", ".xlsx", ".xls", ".csv", ".docx")]
+    if _upload_files:
+        _disk_e = await _load_entities_from_uploads()
+        _identity_ok = (
+            e
+            and e.get("owner_name", "") not in ("", "Review Required")
+            and len([v for v in e.values() if v and v not in ("—", "Review Required")]) >= 3
+        )
+        if not _identity_ok:
+            e = _disk_e  # full override when frontend sent nothing useful
+        else:
+            # Keep frontend identity; replace ALL financial rows with IQ-225 values
+            _financial_keys = {
+                "principal_balance", "special_assessments", "late_fees",
+                "other_charges", "certified_mail_charges", "other_costs",
+                "attorney_fees", "partial_payment", "total_amount_owed",
+                "total_balance", "through_date_str", "monthly_assessment",
+            }
+            for _k in _financial_keys:
+                if _k in _disk_e:
+                    e[_k] = _disk_e[_k]
 
     today = datetime.date.today().strftime("%B %d, %Y")
 
@@ -1867,6 +1890,50 @@ async def generate_ledger(request: LedgerRequest):
         + totals["other"] - totals["credits"], 2
     )
 
+    # ── IQ-225 Statement of Account (Sheet 4) ────────────────────────────────
+    # Read the newest NOLA file from uploads/ to feed the IQ-225 engine
+    _nola_text_ledger = ""
+    _nola_candidates = sorted(
+        [fp for fp in UPLOAD_DIR.iterdir()
+         if fp.suffix.lower() == ".pdf"
+         and any(kw in fp.name.lower() for kw in ("nola", "notice"))],
+        key=lambda fp: fp.stat().st_mtime,
+        reverse=True,
+    )
+    if _nola_candidates:
+        _nola_text_ledger = await asyncio.to_thread(
+            extract_text_from_file,
+            _nola_candidates[0].read_bytes(),
+            _nola_candidates[0].name,
+        )
+    # Build merged dict for IQ-225 — derive monthly_assessment from mode of ledger charges
+    from collections import Counter as _LedgerCounter
+    _merged_iq = dict(e)
+    _asmt_vals = [
+        t.get("charge", 0) for t in line_items
+        if str(t.get("type", "")).strip() == "Regular Assessment" and t.get("charge", 0) > 0
+    ]
+    if _asmt_vals:
+        _merged_iq["monthly_assessment"] = str(_LedgerCounter(_asmt_vals).most_common(1)[0][0])
+    _td_lq = datetime.date.today()
+    _through_lq = (
+        datetime.date(_td_lq.year + 1, 1, 1) if _td_lq.month == 12
+        else datetime.date(_td_lq.year, _td_lq.month + 1, 1)
+    )
+    iq_tbl = None
+    try:
+        iq_tbl = _compute_demand_letter_table(
+            nola_text=_nola_text_ledger,
+            transactions=line_items,
+            merged=_merged_iq,
+            through_date=_through_lq,
+            certified_mail=40.0,
+            other_costs=16.0,
+            attorney_fees_override=400.0,
+        )
+    except Exception:
+        pass  # non-fatal — sheet is omitted if computation fails
+
     # ── Sheet 1: Unit Owner Cheat Sheet (all matter variables) ───────────────
     cheat_rows = [
         ("MATTER INFORMATION", ""),
@@ -2110,6 +2177,49 @@ async def generate_ledger(request: LedgerRequest):
                 for cell in row:
                     cell.border = thin
                 row[2].fill = yes_f if status == "YES" else pend_f
+
+            # ── Sheet 4: Statement of Account (IQ-225 demand letter table) ──
+            if iq_tbl:
+                through_lbl = iq_tbl["through_date_str"]
+                soa_rows = [
+                    (f"Maintenance due including {through_lbl}",
+                     float(iq_tbl["maintenance"])),
+                    (f"Special assessments due including {through_lbl}",
+                     float(iq_tbl["special_assessments"])),
+                    ("Late fees, if applicable",
+                     float(iq_tbl["late_fees"])),
+                    ("Other charges",
+                     float(iq_tbl["other_charges"])),
+                    ("Certified mail charges",
+                     float(iq_tbl["certified_mail"])),
+                    ("Other costs",
+                     float(iq_tbl["other_costs"])),
+                    ("Attorney's fees",
+                     float(iq_tbl["attorney_fees"])),
+                    ("Partial Payment",
+                     -float(iq_tbl["partial_payment"])),
+                    ("TOTAL OUTSTANDING",
+                     float(iq_tbl["total_outstanding"])),
+                ]
+                df4 = pd.DataFrame(soa_rows, columns=["Description", "Amount ($)"])
+                df4.to_excel(writer, sheet_name="Statement of Account", index=False)
+                ws4 = writer.sheets["Statement of Account"]
+                ws4.column_dimensions["A"].width = 52
+                ws4.column_dimensions["B"].width = 18
+                for cell in ws4[1]:
+                    cell.font  = Font(bold=True, color="FFFFFF", size=10)
+                    cell.fill  = navy
+                    cell.border = thin
+                    cell.alignment = Alignment(horizontal="center")
+                for row in ws4.iter_rows(min_row=2):
+                    is_total = "TOTAL" in str(row[0].value or "")
+                    for cell in row:
+                        cell.border = thin
+                        cell.alignment = Alignment(vertical="center")
+                        cell.font = Font(bold=is_total, size=11 if is_total else 10)
+                    if is_total:
+                        for cell in row:
+                            cell.fill = gold
 
     await asyncio.to_thread(_build_excel)
 
